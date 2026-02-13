@@ -5,12 +5,16 @@
 #include <QMessageBox>
 #include <logfileparser.h>
 #include <mathematics.h>
+#include <kalman.h>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
 {
     ui->setupUi(this);
+
+    ui->cbMethod->addItems(m_cbMethodItems.values());
+    ui->cbMethod->setCurrentIndex(static_cast<int>(cbMethodItemIndexes::Geocentric));
 }
 
 MainWindow::~MainWindow()
@@ -18,8 +22,23 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
+struct PointsData
+{
+    Mathematics::Point xyz;             ///< Координаты точки в геоцентрических координатах
+    Mathematics::GeographicPoint geo;   ///< Координаты точки в географических координатах
+    double vx;                          ///< Скорость по оси X, см/с
+    double vy;                          ///< Скорость по оси Y, см/с
+    double vz;                          ///< Скорость по оси Z, см/с
+    double vh;                          ///< Скорость снижения, см/с
+    double accx;                        ///< Ускорение по оси X, см/с^2
+    double accy;                        ///< Ускорение по оси Y, см/с^2
+    double accz;                        ///< Ускорение по оси Z, см/с^2
+    double acch;                        ///< Ускорение снижения, см/с^2
+};
+
 void MainWindow::on_bFileName_clicked()
 {
+    // 1. Выбор файла с логом пакетов
     QString filename = showFileDialog(this, "Выбор файла с логом событий для БЛА.", "", windowIcon());
     if (filename.isEmpty())
     {
@@ -28,6 +47,7 @@ void MainWindow::on_bFileName_clicked()
     }
     ui->tFileName->setText(filename);
 
+    // 2. Получение отсортированного по времени списка MAVLink-пакетов GLOBAL_POSITION_INT
     std::map<uint64_t, mavlink_message_t> messages;
     try
     {
@@ -47,60 +67,110 @@ void MainWindow::on_bFileName_clicked()
         return;
     }
 
-    std::array<mavlink_global_position_int_t, 3> glpos; // Нужно три точки для вычисления скорости и ускорения
-    std::map<uint64_t, mavlink_message_t>::reverse_iterator rit = messages.rbegin();
-    std::array<mavlink_global_position_int_t, 3>::reverse_iterator glposrit = glpos.rbegin();
+    // 3. Преобразование данных в указанную систему и пропускание через фильтр Кальмана в отдельный список данных
+    int32_t deltah = 0; // Разница высот над поверхностью Земли и над уровнем моря
+    std::map<uint32_t, PointsData> filteredblh;
+    Kalman kf(0.1);
 
-    int counter = 3;
-    for (;counter > 0 && rit != messages.rend();counter--, rit++, glposrit++)
-        mavlink_msg_global_position_int_decode(&rit->second, &*glposrit);
+    // ui->lData->appendPlainText("Время,мс\tДолгота,гр.\tШирота,гр.\tВысота,см\tX,см\tY,см\tZ,см\tVx,см/с\tVy,см/с\tVz,см/с\tAx,см/с^2\tAy,см/с^2\tAz,см/с^2");
+    ui->lData->appendPlainText("Время,мс\tДолгота,гр.\tШирота,гр.\tВысота,см\tX,см\tY,см\tZ,см");
 
-    Mathematics::Point lastPoint = Mathematics::CordinateToPoint(Mathematics::Cordinates{glpos.rbegin()->lat, glpos.rbegin()->lon});
-    float lastSpeedX;
-    float lastSpeedY;
-    float lastSpeedZ;
-
-    Mathematics::Point lastPoint2 = Mathematics::CordinateToPoint(Mathematics::Cordinates{glpos[1].lat, glpos[1].lon});
-    if (counter != 2) // Есть две или три точки для расчёта
+    for (const std::pair<uint64_t, mavlink_message_t> &val : messages)
     {
-        lastSpeedX = Mathematics::CountTimeChangeParam(lastPoint2.x, lastPoint.x, glpos[2].time_boot_ms - glpos[1].time_boot_ms);
-        lastSpeedY = Mathematics::CountTimeChangeParam(lastPoint2.y, lastPoint.y, glpos[2].time_boot_ms - glpos[1].time_boot_ms);
-        lastSpeedZ = Mathematics::CountTimeChangeParam(glpos[2].relative_alt / 10, glpos[1].relative_alt / 10, glpos[2].time_boot_ms - glpos[1].time_boot_ms);
-    }
-    else // Есть только одна точка для расчёта
-    {
-        lastSpeedX = glpos.rbegin()->vx;
-        lastSpeedY = glpos.rbegin()->vy;
-        lastSpeedZ = glpos.rbegin()->vz;
+        PointsData pdata; // Данные о точке
+
+        // Преобразование из массива в структуру данных MAVLink
+        mavlink_global_position_int_t glpos;
+        mavlink_msg_global_position_int_decode(&val.second, &glpos);
+        pdata.geo = {glpos.lat, glpos.lon, glpos.alt / 10};
+
+        // Нахождение координат в зависимости от заданного метода преобразования
+        switch (static_cast<cbMethodItemIndexes>(ui->cbMethod->currentIndex()))
+        {
+        case cbMethodItemIndexes::Projection:
+            pdata.xyz = Mathematics::WGS84ToProjection(pdata.geo);
+            break;
+        case cbMethodItemIndexes::Geocentric:
+            pdata.xyz = Mathematics::WGS84ToXYZ(pdata.geo);
+            break;
+        }
+
+        // Сохранение разницы высот относительно поверхности Земли и относительно уровня моря
+        deltah = (glpos.alt - glpos.relative_alt) / 10;
+        pdata.xyz.dz = deltah;
+
+        // Вычисление периода времени текущего измерения относительно предыдущего
+        uint32_t dt = 0; // Период времени от предыдущего измерения
+        if (filteredblh.size() > 0) // Если это не первая порция данных
+            dt = glpos.time_boot_ms - filteredblh.rbegin()->first;
+
+        // Фильтрация данных фильтром Калмана, если это требуется
+        if (ui->chKalman->isChecked())
+        {
+            if (dt != 0) // Если удалось определить время для предсказания
+            {
+                kf.setPredictionPeriod(static_cast<double>(dt) / 1000);
+                kf.predict();
+            }
+            Vector3d v(pdata.xyz.x, pdata.xyz.y, pdata.xyz.z);
+            kf.update(v);
+            pdata.xyz = {static_cast<int32_t>(kf.getState().x()), static_cast<int32_t>(kf.getState().y()), static_cast<int32_t>(kf.getState().z()), deltah};
+        }
+
+        // Подсчёт скоростей по всем осям и высоте, если это возможно
+        if (filteredblh.size() > 0)
+        {
+            pdata.vx = Mathematics::CountTimeChangeParam(filteredblh.rbegin()->second.xyz.x, pdata.xyz.x, dt);
+            pdata.vy = Mathematics::CountTimeChangeParam(filteredblh.rbegin()->second.xyz.y, pdata.xyz.y, dt);
+            pdata.vz = Mathematics::CountTimeChangeParam(filteredblh.rbegin()->second.xyz.z, pdata.xyz.z, dt);
+            pdata.vh = Mathematics::CountTimeChangeParam(pdata.geo.altitude, filteredblh.rbegin()->second.geo.altitude, dt);
+        }
+        else
+            pdata.vx = pdata.vy = pdata.vz = pdata.vh = 0;
+
+        // Подсчёт ускорений по всем осям и высоте, если это возможно
+        if (filteredblh.size() > 1)
+        {
+            pdata.accx = Mathematics::CountTimeChangeParam(filteredblh.rbegin()->second.vx, pdata.vx, dt);
+            pdata.accy = Mathematics::CountTimeChangeParam(filteredblh.rbegin()->second.vy, pdata.vy, dt);
+            pdata.accz = Mathematics::CountTimeChangeParam(filteredblh.rbegin()->second.vz, pdata.vz, dt);
+            pdata.acch = Mathematics::CountTimeChangeParam(filteredblh.rbegin()->second.vh, pdata.vh, dt);
+        }
+        else
+            pdata.accx = pdata.accy = pdata.accz = pdata.acch = 0;
+
+        // Вывод данных в окно на главном окне
+        QString s = QString("%1\t%2\t%3\t%4\t%5\t%6\t%7"/*\t%8\t%9\t%10\t%11\t%12\t%13"*/).arg(glpos.time_boot_ms).arg(glpos.lat / Mathematics::DegreeAccuracy)
+                        .arg(glpos.lon / Mathematics::DegreeAccuracy).arg(glpos.alt / 10).arg(pdata.xyz.x).arg(pdata.xyz.y).arg(pdata.xyz.z)
+                        // .arg(pdata.vx).arg(pdata.vy).arg(pdata.vz).arg(pdata.accx).arg(pdata.accy).arg(pdata.accz)
+            ;
+        ui->lData->appendPlainText(s);
+
+        filteredblh.emplace(glpos.time_boot_ms, std::move(pdata)); // Сохранение данных в сортированный контейнер
     }
 
-    float acceleratX;
-    float acceleratY;
-    float acceleratZ;
-
-    if (counter == 0) // Есть три точки для расчёта
-    {
-        Mathematics::Point lastPoint3 = Mathematics::CordinateToPoint(Mathematics::Cordinates{glpos[0].lat, glpos[0].lon});
-        float firstSpeedX = Mathematics::CountTimeChangeParam(lastPoint3.x, lastPoint2.x, glpos[1].time_boot_ms - glpos[0].time_boot_ms);
-        float firstSpeedY = Mathematics::CountTimeChangeParam(lastPoint3.y, lastPoint2.y, glpos[1].time_boot_ms - glpos[0].time_boot_ms);
-        float firstSpeedZ = Mathematics::CountTimeChangeParam(glpos[1].relative_alt / 10, glpos[0].relative_alt / 10, glpos[1].time_boot_ms - glpos[0].time_boot_ms);
-
-        acceleratX = Mathematics::CountTimeChangeParam(firstSpeedX, lastSpeedX, glpos[2].time_boot_ms - glpos[1].time_boot_ms);
-        acceleratY = Mathematics::CountTimeChangeParam(firstSpeedY, lastSpeedY, glpos[2].time_boot_ms - glpos[1].time_boot_ms);
-        acceleratZ = Mathematics::CountTimeChangeParam(firstSpeedZ, lastSpeedZ, glpos[2].time_boot_ms - glpos[1].time_boot_ms);
-    }
-    else // Есть только одна или две точки для расчёта
-    {
-        acceleratX = 0;
-        acceleratY = 0;
-        acceleratZ = 0;
-    }
-
-    Mathematics::Cordinates res;
+    // 4. Преобразование в WGS84
+    Mathematics::GeographicPoint res;
     try
     {
-        Mathematics::Point p = Mathematics::FindNewPosition(lastPoint.x, lastPoint.y, glpos.rbegin()->relative_alt / 10, lastSpeedX, lastSpeedY, lastSpeedZ, acceleratX, acceleratY, acceleratZ);
-        res = Mathematics::PointToCordinate(glpos.rbegin()->lat, p);
+        PointsData ppp = filteredblh.rbegin()->second;
+        // Поиск точки падения
+        Mathematics::Point p = Mathematics::FindNewPosition(filteredblh.rbegin()->second.xyz.x, filteredblh.rbegin()->second.xyz.y, filteredblh.rbegin()->second.xyz.z,
+                                                            filteredblh.rbegin()->second.geo.altitude - filteredblh.rbegin()->second.xyz.dz, filteredblh.rbegin()->second.vx,
+                                                            filteredblh.rbegin()->second.vy, filteredblh.rbegin()->second.vz, filteredblh.rbegin()->second.vh,
+                                                            filteredblh.rbegin()->second.accx, filteredblh.rbegin()->second.accy, filteredblh.rbegin()->second.accz,
+                                                            filteredblh.rbegin()->second.acch);
+
+        // Обратное преобразование в географическую систему в зависимости от указанного метода
+        switch (static_cast<cbMethodItemIndexes>(ui->cbMethod->currentIndex()))
+        {
+        case cbMethodItemIndexes::Projection:
+            res = Mathematics::ProjectionToWGS84(filteredblh.rbegin()->second.geo.lattitude, p);
+            break;
+        case cbMethodItemIndexes::Geocentric:
+            res = Mathematics::XYZToWGS84(p);
+            break;
+        }
     }
     catch (const std::exception &ex)
     {
@@ -109,17 +179,18 @@ void MainWindow::on_bFileName_clicked()
         return;
     }
 
-    ui->tLastLattitude->setText((std::to_string(static_cast<float>(std::abs(glpos.rbegin()->lat)) / Mathematics::DegreeAccuracy) + (glpos.rbegin()->lat > 0 ? " с.ш." : " ю.ш.")).c_str());
-    ui->tLastLongitude->setText((std::to_string(static_cast<float>(std::abs(glpos.rbegin()->lon)) / Mathematics::DegreeAccuracy) + (glpos.rbegin()->lon > 0 ? " в.д." : " з.д.")).c_str());
-    ui->tLastAltitude->setText((std::to_string(static_cast<float>(glpos.rbegin()->relative_alt) / 100) + " м").c_str());
+    // 5. Отображение результатов
+    ui->tLastLattitude->setText((std::to_string(static_cast<float>(std::abs(filteredblh.rbegin()->second.geo.lattitude)) / Mathematics::DegreeAccuracy) + (filteredblh.rbegin()->second.geo.lattitude > 0 ? " с.ш." : " ю.ш.")).c_str());
+    ui->tLastLongitude->setText((std::to_string(static_cast<float>(std::abs(filteredblh.rbegin()->second.geo.longitude)) / Mathematics::DegreeAccuracy) + (filteredblh.rbegin()->second.geo.longitude > 0 ? " в.д." : " з.д.")).c_str());
+    ui->tLastAltitude->setText((std::to_string(static_cast<float>(filteredblh.rbegin()->second.geo.altitude - filteredblh.rbegin()->second.xyz.dz) / 100) + " м").c_str());
     ui->tLattitude->setText((std::to_string(static_cast<float>(std::abs(res.lattitude)) / Mathematics::DegreeAccuracy) + (res.lattitude > 0 ? " с.ш." : " ю.ш.")).c_str());
     ui->tLongitude->setText((std::to_string(static_cast<float>(std::abs(res.longitude)) / Mathematics::DegreeAccuracy) + (res.longitude > 0 ? " в.д." : " з.д.")).c_str());
-    ui->tAltitude->setText((std::to_string(static_cast<float>(glpos.rbegin()->alt - glpos.rbegin()->relative_alt) / 100) + " м").c_str());
+    ui->tAltitude->setText((std::to_string(static_cast<float>(res.altitude) / 100) + " м").c_str());
 
-    if (counter == 2)
+    if (filteredblh.size() == 1)
         showMessageBox(this, "ПЕДУПРЕЖДЕНИЕ!", "Расчёт проводился по одной точке.", windowIcon());
 
-    if (counter == 1)
+    if (filteredblh.size() == 2)
         showMessageBox(this, "ПЕДУПРЕЖДЕНИЕ!", "Расчёт проводился по двум точкам.", windowIcon());
 }
 

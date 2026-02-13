@@ -36,6 +36,18 @@ private:
     /// @param icon - иконка для вызываемого окна
     void showMessageBox(QWidget *parent, const QString &title, const QString &msg, const QIcon &icon);
 
+    enum class cbMethodItemIndexes
+    {
+        Projection,
+        Geocentric
+    };
+
+    const QMap<cbMethodItemIndexes, QString> m_cbMethodItems
+    {
+        {cbMethodItemIndexes::Projection, "Через проекционную систему"},
+        {cbMethodItemIndexes::Geocentric, "Через геоцентрическую систему"}
+    };                                                                      ///< Список строк для перечня используемых методов преобразования координат
+
     Ui::MainWindow *ui;
 };
 #endif // MAINWINDOW_H
