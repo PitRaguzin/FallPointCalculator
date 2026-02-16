@@ -20,6 +20,11 @@ public:
 private slots:
     void on_bFileName_clicked();
 
+    void on_bStart_clicked();
+
+signals:
+    void persent(int persent);
+
 private:
     /// @brief Открытие окна выбора файла
     /// @param parent - родитель вызываемого окна

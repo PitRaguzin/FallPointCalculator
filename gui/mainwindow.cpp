@@ -38,16 +38,22 @@ struct PointsData
 
 void MainWindow::on_bFileName_clicked()
 {
-    // 1. Выбор файла с логом пакетов
     QString filename = showFileDialog(this, "Выбор файла с логом событий для БЛА.", "", windowIcon());
     if (filename.isEmpty())
     {
         showMessageBox(this, "ОШИБКА!", "Файл лога не был выбран.", windowIcon());
+        ui->tFileName->setText("");
+        ui->bStart->setEnabled(false);
         return;
     }
     ui->tFileName->setText(filename);
+    ui->bStart->setEnabled(true);
+}
 
-    // 2. Получение отсортированного по времени списка MAVLink-пакетов GLOBAL_POSITION_INT
+void MainWindow::on_bStart_clicked()
+{
+    // 1. Получение отсортированного по времени списка MAVLink-пакетов GLOBAL_POSITION_INT
+    QString filename = ui->tFileName->text();
     std::map<uint64_t, mavlink_message_t> messages;
     try
     {
@@ -67,7 +73,7 @@ void MainWindow::on_bFileName_clicked()
         return;
     }
 
-    // 3. Преобразование данных в указанную систему и пропускание через фильтр Кальмана в отдельный список данных
+    // 2. Преобразование данных в указанную систему и пропускание через фильтр Кальмана в отдельный список данных
     int32_t deltah = 0; // Разница высот над поверхностью Земли и над уровнем моря
     std::map<uint32_t, PointsData> filteredblh;
     Kalman kf(0.1);
@@ -142,14 +148,15 @@ void MainWindow::on_bFileName_clicked()
         // Вывод данных в окно на главном окне
         QString s = QString("%1\t%2\t%3\t%4\t%5\t%6\t%7"/*\t%8\t%9\t%10\t%11\t%12\t%13"*/).arg(glpos.time_boot_ms).arg(glpos.lat / Mathematics::DegreeAccuracy)
                         .arg(glpos.lon / Mathematics::DegreeAccuracy).arg(glpos.alt / 10).arg(pdata.xyz.x).arg(pdata.xyz.y).arg(pdata.xyz.z)
-                        // .arg(pdata.vx).arg(pdata.vy).arg(pdata.vz).arg(pdata.accx).arg(pdata.accy).arg(pdata.accz)
+            // .arg(pdata.vx).arg(pdata.vy).arg(pdata.vz).arg(pdata.accx).arg(pdata.accy).arg(pdata.accz)
             ;
         ui->lData->appendPlainText(s);
+        ui->centralwidget->update();
 
         filteredblh.emplace(glpos.time_boot_ms, std::move(pdata)); // Сохранение данных в сортированный контейнер
     }
 
-    // 4. Преобразование в WGS84
+    // 3. Преобразование в WGS84
     Mathematics::GeographicPoint res;
     try
     {
@@ -179,7 +186,7 @@ void MainWindow::on_bFileName_clicked()
         return;
     }
 
-    // 5. Отображение результатов
+    // 4. Отображение результатов
     ui->tLastLattitude->setText((std::to_string(static_cast<float>(std::abs(filteredblh.rbegin()->second.geo.lattitude)) / Mathematics::DegreeAccuracy) + (filteredblh.rbegin()->second.geo.lattitude > 0 ? " с.ш." : " ю.ш.")).c_str());
     ui->tLastLongitude->setText((std::to_string(static_cast<float>(std::abs(filteredblh.rbegin()->second.geo.longitude)) / Mathematics::DegreeAccuracy) + (filteredblh.rbegin()->second.geo.longitude > 0 ? " в.д." : " з.д.")).c_str());
     ui->tLastAltitude->setText((std::to_string(static_cast<float>(filteredblh.rbegin()->second.geo.altitude - filteredblh.rbegin()->second.xyz.dz) / 100) + " м").c_str());
@@ -213,4 +220,5 @@ void MainWindow::showMessageBox(QWidget *parent, const QString &title, const QSt
     msbox.setStandardButtons(QMessageBox::StandardButton::Ok);
     msbox.exec();
 }
+
 
