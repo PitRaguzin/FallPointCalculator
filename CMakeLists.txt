@@ -42,7 +42,7 @@ if(WIN32)
     set(WIX_PATH "C:/Program Files (x86)/WiX Toolset v3.11/bin")
 
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/deploy)
-    file(COPY "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.exe" DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/deploy/)
+    file(COPY ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.exe DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/deploy/)
     file(COPY ${CMAKE_CURRENT_BINARY_DIR}/gui/MainWindow.dll DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/deploy/)
 
     qt_deploy_runtime_dependencies(${PROJECT_NAME} ${CMAKE_CURRENT_BINARY_DIR}/deploy/)
